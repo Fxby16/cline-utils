@@ -44,6 +44,10 @@ def convert(input_dir, output_dir):
                 mp3_file = os.path.splitext(file)[0] + '.mp3'
                 mp3_path = os.path.join(mp3_dir, mp3_file)
 
+                if os.path.exists(mp3_path):
+                    print(f"Skipping {flac_path} (already converted)")
+                    continue
+
                 print(f"Converting {flac_path} to {mp3_path}")
                 try:
                     ffmpeg_convert(flac_path, mp3_path)
