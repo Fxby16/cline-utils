@@ -48,9 +48,6 @@ def main():
     parser.add_argument("output_dir", help="Directory to save MP3 files")
     args = parser.parse_args()
 
-    print(f"Input directory: {args.input_dir}")
-    print(f"Output directory: {args.output_dir}")
-
     convert(args.input_dir, args.output_dir)
 
 if __name__ == "__main__":
