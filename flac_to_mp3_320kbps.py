@@ -22,6 +22,8 @@ def ffmpeg_convert(flac_file, mp3_file):
         )
     except ffmpeg.Error as e:
         print(f"Error converting {flac_file} to {mp3_file}: {e.stderr.decode()}")
+        if os.path.exists(mp3_file):
+            os.remove(mp3_file)
 
     print(f"Successfully converted {flac_file} to {mp3_file}")
 
@@ -43,7 +45,13 @@ def convert(input_dir, output_dir):
                 mp3_path = os.path.join(mp3_dir, mp3_file)
 
                 print(f"Converting {flac_path} to {mp3_path}")
-                ffmpeg_convert(flac_path, mp3_path)
+                try:
+                    ffmpeg_convert(flac_path, mp3_path)
+                except KeyboardInterrupt:
+                    print(f"\nInterrupted! Deleting incomplete file {mp3_path}")
+                    if os.path.exists(mp3_path):
+                        os.remove(mp3_path)
+                    raise
 
 def main():
     parser = argparse.ArgumentParser(description="Convert FLAC files to MP3.")
