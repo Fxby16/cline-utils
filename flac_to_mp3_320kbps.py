@@ -1,3 +1,6 @@
+# Convert FLAC files to MP3 at 320kbps using ffmpeg, preserving metadata and album art.
+# Usage: python flac_to_mp3_320kbps.py <input-directory> <output-directory>
+
 import argparse
 import os
 import ffmpeg
