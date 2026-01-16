@@ -2,30 +2,32 @@
 # Usage: python flac_to_mp3_320kbps.py <input-directory> <output-directory>
 
 import argparse
+import subprocess
 import os
-import ffmpeg
 
 def ffmpeg_convert(flac_file, mp3_file):
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", flac_file,
+        "-map", "0:a",
+        "-map", "0:v?",
+        "-c:a", "libmp3lame",
+        "-b:a", "320k",
+        "-c:v", "mjpeg",
+        "-disposition:v", "attached_pic",
+        "-map_metadata", "0",
+        "-write_id3v2", "1",
+        mp3_file
+    ]
+
     try:
-        (
-        ffmpeg
-        .input(flac_file)
-        .output(
-            mp3_file, 
-            audio_bitrate='320k',
-            map=['0:a', '0:v'],
-            map_metadata=0,
-            **{'c:v': 'copy', 'disposition:v': 'attached_pic'}
-        )
-        .overwrite_output()
-        .run(quiet=True)
-        )
-    except ffmpeg.Error as e:
-        print(f"Error converting {flac_file} to {mp3_file}: {e.stderr.decode()}")
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        print(f"Successfully converted {flac_file} to {mp3_file}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error converting {flac_file}:\n{e.stderr.decode()}")
         if os.path.exists(mp3_file):
             os.remove(mp3_file)
 
-    print(f"Successfully converted {flac_file} to {mp3_file}")
 
 def convert(input_dir, output_dir):
     if not os.path.exists(output_dir):
