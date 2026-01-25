@@ -47,8 +47,18 @@ def convert(input_dir, output_dir):
                 mp3_path = os.path.join(mp3_dir, mp3_file)
 
                 if os.path.exists(mp3_path):
-                    print(f"Skipping {flac_path} (already converted)")
-                    continue
+                    try:
+                        flac_mtime = os.path.getmtime(flac_path)
+                        mp3_mtime = os.path.getmtime(mp3_path)
+                    except OSError:
+                        flac_mtime = None
+                        mp3_mtime = None
+
+                    if flac_mtime is not None and mp3_mtime is not None and flac_mtime > mp3_mtime:
+                        print(f"Re-converting {flac_path} (FLAC is newer than existing MP3)")
+                    else:
+                        print(f"Skipping {flac_path} (MP3 is up-to-date)")
+                        continue
 
                 print(f"Converting {flac_path} to {mp3_path}")
                 try:
