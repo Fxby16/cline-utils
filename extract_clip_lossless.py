@@ -15,6 +15,9 @@ Usage:
 Examples:
   python extract_clip_lossless.py movie.mkv -s 00:10:00 -d 00:00:30
   python extract_clip_lossless.py movie.mp4 -s 600 -e 630 -o clip.mp4
+
+Notes:
+- In some cases, it seems that adding --accurate-seek causes missing frames at the start of the clip.  
 """
 
 from __future__ import annotations
@@ -59,14 +62,15 @@ def _parse_time_to_seconds(value: str) -> float:
 
 
 def _format_seconds_as_time(seconds: float) -> str:
-    # Keep it simple; ffmpeg accepts plain seconds too, but HH:MM:SS is readable.
+    """Format seconds as HH:MM:SS.mmm (keeps subseconds for precision)."""
     if seconds < 0:
         seconds = 0
-    total = int(seconds)
-    hh = total // 3600
-    mm = (total % 3600) // 60
-    ss = total % 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    hh = int(seconds // 3600)
+    mm = int((seconds % 3600) // 60)
+    ss = seconds - hh * 3600 - mm * 60
+    # Keep milliseconds when present, strip trailing zeros.
+    ss_str = f"{ss:06.3f}" if ss % 1 else f"{int(ss):02d}"
+    return f"{hh:02d}:{mm:02d}:{ss_str}"
 
 
 def _which_or_die(tool: str) -> str:
@@ -106,8 +110,10 @@ def build_ffmpeg_command(
     ffmpeg: str,
     input_file: str,
     start: str,
+    start_shift: float,
     end: str | None,
     duration: str | None,
+    end_pad: float,
     output_file: str,
     fast_seek: bool,
     map_all_streams: bool,
@@ -115,9 +121,18 @@ def build_ffmpeg_command(
 ) -> list[str]:
     cmd: list[str] = [ffmpeg, "-hide_banner"]
 
+    # Allow small user-controlled shift/pad for fast-seek: positive shift_start means
+    # "start a bit later". To make this effective even with keyframe-aligned fast-seek,
+    # we seek to the requested start (pre-input), then trim the extra shift after input.
+    start_seconds = max(0.0, _parse_time_to_seconds(start))
+    post_trim_seconds = max(0.0, float(start_shift)) if fast_seek else 0.0
+    end_pad = max(0.0, float(end_pad))
+    start_formatted = _format_seconds_as_time(start_seconds)
+    post_trim_formatted = _format_seconds_as_time(post_trim_seconds)
+
     # Fast seek places -ss before -i (more efficient, but keyframe-aligned).
     if fast_seek:
-        cmd += ["-ss", start]
+        cmd += ["-ss", start_formatted]
 
     # Helps when timestamps are missing/odd; can reduce timestamp-related issues on copy.
     cmd += ["-fflags", "+genpts"]
@@ -127,16 +142,24 @@ def build_ffmpeg_command(
     # Accurate seek puts -ss after -i (still not truly frame-accurate with -c copy,
     # but can be closer in some cases).
     if not fast_seek:
-        cmd += ["-ss", start]
+        cmd += ["-ss", start_formatted]
+
+    # In fast seek mode, apply an optional post-input trim to honor start_shift even if the
+    # pre-seek landed on a previous keyframe.
+    if fast_seek and post_trim_seconds > 0:
+        cmd += ["-ss", post_trim_formatted]
 
     if duration:
-        cmd += ["-t", duration]
+        # If we trimmed some time after input, extend -t to preserve requested clip length.
+        dur_seconds = _parse_time_to_seconds(duration) + end_pad + post_trim_seconds
+        cmd += ["-t", _format_seconds_as_time(dur_seconds)]
     elif end:
         # Use -t with a computed duration to avoid ambiguous -to semantics.
         # This also guarantees the clip length is (end-start) regardless of seek mode.
-        clip_len = _parse_time_to_seconds(end) - _parse_time_to_seconds(start)
+        clip_len = _parse_time_to_seconds(end) - start_seconds
         if clip_len <= 0:
             raise ValueError("End time must be greater than start time.")
+        clip_len += end_pad + post_trim_seconds
         cmd += ["-t", _format_seconds_as_time(clip_len)]
 
     if map_all_streams:
@@ -166,6 +189,12 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-e", "--end", help="End time (e.g. 00:01:53.000)")
     group.add_argument("-d", "--duration", help="Duration (e.g. 00:00:30.000)")
+    parser.add_argument(
+        "--shift-start",
+        type=float,
+        default=0.0,
+        help="Nudge start time by this many seconds (positive = start later, negative = earlier).",
+    )
     parser.add_argument("-o", "--output", help="Output file path. Default: <input>_clip_<...>.<same_ext>")
     parser.add_argument(
         "--fast-seek",
@@ -191,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-timestamps",
         action="store_true",
         help="Do not reset timestamps (disables -reset_timestamps 1).",
+    )
+    parser.add_argument(
+        "--end-pad",
+        type=float,
+        default=0.2,
+        help="Extend clip length by this many seconds to avoid early cut (default 0.2s).",
     )
 
     args = parser.parse_args(argv)
@@ -221,8 +256,10 @@ def main(argv: list[str] | None = None) -> int:
         ffmpeg=ffmpeg,
         input_file=str(input_path),
         start=args.start,
+        start_shift=args.shift_start,
         end=args.end,
         duration=args.duration,
+        end_pad=args.end_pad,
         output_file=str(output_path),
         fast_seek=fast_seek,
         map_all_streams=map_all_streams,
