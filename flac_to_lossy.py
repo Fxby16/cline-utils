@@ -26,7 +26,9 @@ def get_source_sample_rate(source):
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         sample_rate = result.stdout.strip()
         if sample_rate.isdigit():
-            return sample_rate
+            # Limit to 48 kHz for compatibility.
+            return str(min(int(sample_rate), 48000))
+        return "48000"
     except (subprocess.CalledProcessError, OSError):
         pass
     return None
