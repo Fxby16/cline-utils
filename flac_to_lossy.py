@@ -5,9 +5,18 @@ import shutil
 import json
 import re
 import time
+import threading
 
 LOUDNORM_BASE_FILTER = "loudnorm=I=-16:LRA=11:TP=-1.5"
 PASSTHROUGH_LOSSY_CODECS = {"mp3", "aac"}
+
+
+def is_interrupted_process_output(output_text):
+    if not output_text:
+        return False
+
+    text = output_text.lower()
+    return "received signal 2" in text or "immediate exit requested" in text
 
 def get_source_sample_rate(source):
     cmd = [
@@ -23,7 +32,7 @@ def get_source_sample_rate(source):
         source,
     ]
     try:
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         sample_rate = result.stdout.strip()
         if sample_rate.isdigit():
             # Limit to 48 kHz for compatibility.
@@ -48,7 +57,7 @@ def get_source_audio_codec(source):
         source,
     ]
     try:
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         codec = result.stdout.strip().lower()
         return codec or None
     except (subprocess.CalledProcessError, OSError):
@@ -61,8 +70,15 @@ def run_subprocess(cmd, source, target):
         return True
     except subprocess.CalledProcessError as e:
         stderr_text = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr)
+
+        if is_interrupted_process_output(stderr_text):
+            if os.path.exists(target):
+                os.remove(target)
+            return None
+
         print(f"Error converting {source}:\n{stderr_text}")
         if os.path.exists(target):
+            print(f"Deleting incomplete file {target}")
             os.remove(target)
         return False
 
@@ -123,8 +139,15 @@ def get_two_pass_loudnorm_filter(source):
             encoding="utf-8",
             errors="replace",
         )
-    except (subprocess.CalledProcessError, OSError) as e:
-        error_output = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
+    except subprocess.CalledProcessError as e:
+        if is_interrupted_process_output(e.stderr):
+            return None
+
+        error_output = e.stderr
+        print(f"Warning: loudnorm analysis failed for {source}, falling back to single-pass.\n{error_output}")
+        return base_filter
+    except OSError as e:
+        error_output = str(e)
         print(f"Warning: loudnorm analysis failed for {source}, falling back to single-pass.\n{error_output}")
         return base_filter
 
@@ -168,7 +191,10 @@ def ffmpeg_convert_mp3(source, target, bitrate, normalize_volume, use_two_pass):
     ]
 
     if normalize_volume:
-        cmd += ["-af", get_normalization_filter(source, use_two_pass)]
+        normalization_filter = get_normalization_filter(source, use_two_pass)
+        if normalization_filter is None:
+            return None
+        cmd += ["-af", normalization_filter]
         if sample_rate:
             cmd += ["-ar", sample_rate]
 
@@ -195,7 +221,10 @@ def ffmpeg_convert_aac(source, target, bitrate, normalize_volume, use_two_pass):
     ]
 
     if normalize_volume:
-        cmd += ["-af", get_normalization_filter(source, use_two_pass)]
+        normalization_filter = get_normalization_filter(source, use_two_pass)
+        if normalization_filter is None:
+            return None
+        cmd += ["-af", normalization_filter]
         if sample_rate:
             cmd += ["-ar", sample_rate]
 
@@ -235,9 +264,9 @@ def convert_file(source, target, codec, bitrate, normalize_volume, overwrite, us
         print(f"\nInterrupted! Deleting incomplete file {target}")
         if os.path.exists(target):
             os.remove(target)
-        raise
+        return None
 
-def convert_dir(input_dir, output_dir, codec, bitrate, normalize_volume, overwrite, use_two_pass, stats):
+def convert_dir(input_dir, output_dir, num_threads, codec, bitrate, normalize_volume, overwrite, use_two_pass, stats):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -249,44 +278,122 @@ def convert_dir(input_dir, output_dir, codec, bitrate, normalize_volume, overwri
     elif codec == "aac":
         extension = ".m4a"
 
-    for root, _, files in os.walk(input_dir):
-        for file in files:
-            source_path = os.path.join(root, file)
-            source_codec = get_source_audio_codec(source_path)
+    stats_lock = threading.Lock()
+    workers = []
+    available_threads = num_threads
+    thread_slots = threading.Condition()
+    stop_event = threading.Event()
 
-            if source_codec is None:
-                continue
-
-            relative_path = os.path.relpath(root, input_dir)
-            target_dir = os.path.join(output_dir, relative_path)
-
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
-
-            if source_codec in PASSTHROUGH_LOSSY_CODECS:
-                target_path = os.path.join(target_dir, file)
-                if copy_file(source_path, target_path, overwrite):
-                    stats["copied"] += 1
-            else:
-                target_file = os.path.splitext(file)[0] + extension
-                target_path = os.path.join(target_dir, target_file)
-                if convert_file(source_path, target_path, codec, bitrate, normalize_volume, overwrite, use_two_pass):
+    def convert_worker(source_path, target_path):
+        nonlocal available_threads
+        try:
+            converted = convert_file(source_path, target_path, codec, bitrate, normalize_volume, overwrite, use_two_pass)
+            if converted:
+                with stats_lock:
                     stats["converted"] += 1
+            elif converted is None:
+                stop_event.set()
+                with stats_lock:
+                    stats["interrupted"] = True
+        finally:
+            with thread_slots:
+                available_threads += 1
+                thread_slots.notify_all()
+    try:
+        for root, _, files in os.walk(input_dir):
+            if stop_event.is_set():
+                break
+
+            for file in files:
+                if stop_event.is_set():
+                    break
+
+                source_path = os.path.join(root, file)
+                extension_lower = os.path.splitext(file)[1].lower()
+
+                relative_path = os.path.relpath(root, input_dir)
+                target_dir = os.path.join(output_dir, relative_path)
+
+                if not os.path.exists(target_dir):
+                    os.makedirs(target_dir)
+
+                target_path = os.path.join(target_dir, file)
+
+                if os.path.exists(target_path):
+                    try:
+                        flac_mtime = os.path.getmtime(source_path)
+                        target_mtime = os.path.getmtime(target_path)
+                    except OSError:
+                        flac_mtime = None
+                        target_mtime = None
+
+                    if not overwrite and flac_mtime is not None and target_mtime is not None and flac_mtime <= target_mtime:
+                        print(f"Skipping {source_path} (target is up-to-date)")
+                        continue
+
+                if extension_lower == ".mp3":
+                    if copy_file(source_path, target_path, overwrite):
+                        stats["copied"] += 1
+                    continue
+
+                source_codec = get_source_audio_codec(source_path)
+
+                if source_codec is None:
+                    continue
+
+                if source_codec in PASSTHROUGH_LOSSY_CODECS:
+                    target_path = os.path.join(target_dir, file)
+                    if copy_file(source_path, target_path, overwrite):
+                        stats["copied"] += 1
+                else:
+                    target_file = os.path.splitext(file)[0] + extension
+                    target_path = os.path.join(target_dir, target_file)
+                    with thread_slots:
+                        while available_threads == 0 and not stop_event.is_set():
+                            thread_slots.wait()
+
+                        if stop_event.is_set():
+                            break
+
+                        available_threads -= 1
+
+                    worker = threading.Thread(target=convert_worker, args=(source_path, target_path))
+                    workers.append(worker)
+                    worker.start()
+    except KeyboardInterrupt:
+        print("\nCtrl+C received: waiting for active conversions to stop...")
+        stop_event.set()
+        with stats_lock:
+            stats["interrupted"] = True
+        with thread_slots:
+            thread_slots.notify_all()
+    finally:
+        for worker in workers:
+            while worker.is_alive():
+                try:
+                    worker.join(timeout=0.2)
+                except KeyboardInterrupt:
+                    stop_event.set()
+                    with stats_lock:
+                        stats["interrupted"] = True
             
 
-def convert(source, target, codec, bitrate, normalize_volume, overwrite, use_two_pass):
-    stats = {"converted": 0, "copied": 0}
+def convert(source, target, num_threads, codec, bitrate, normalize_volume, overwrite, use_two_pass):
+    stats = {"converted": 0, "copied": 0, "interrupted": False}
 
     if os.path.isdir(source):
-        convert_dir(source, target, codec, bitrate, normalize_volume, overwrite, use_two_pass, stats)
+        convert_dir(source, target, num_threads, codec, bitrate, normalize_volume, overwrite, use_two_pass, stats)
     elif os.path.isfile(source):
         source_codec = get_source_audio_codec(source)
         if source_codec in PASSTHROUGH_LOSSY_CODECS:
             if copy_file(source, target, overwrite):
                 stats["copied"] += 1
         else:
-            if convert_file(source, target, codec, bitrate, normalize_volume, overwrite, use_two_pass):
+            converted = convert_file(source, target, codec, bitrate, normalize_volume, overwrite, use_two_pass)
+            if converted:
                 stats["converted"] += 1
+            elif converted is None:
+                stats["interrupted"] = True
 
     return stats
 
@@ -306,20 +413,33 @@ def main():
     parser.add_argument("output", help="Output file or directory")
     parser.add_argument("codec", choices=["mp3", "aac"], help="Target codec")
     parser.add_argument("bitrate", help="Target bitrate (e.g. 192k, 320k)")
+    parser.add_argument("--num_threads", type=int, default=1, help="Number of parallel conversion threads")
     parser.add_argument("--normalize_volume", action="store_true", help="Apply loudness normalization to output files")
     parser.add_argument("--single_pass_normalize", action="store_true", help="Use single-pass loudnorm instead of two-pass (faster, less accurate)")
     parser.add_argument("--overwrite", action="store_true", help="Force the script to overwrite the destination")
     args = parser.parse_args()
 
+    if args.num_threads < 1:
+        parser.error("--num_threads must be >= 1")
+
     use_two_pass = not args.single_pass_normalize
     start_time = time.time()
-    stats = convert(args.input, args.output, args.codec, args.bitrate, args.normalize_volume, args.overwrite, use_two_pass)
-    elapsed = time.time() - start_time
+    stats = {"converted": 0, "copied": 0, "interrupted": False}
 
-    print("\n--- Conversion Summary ---")
-    print(f"Time elapsed: {format_elapsed_time(elapsed)}")
-    print(f"Files converted: {stats['converted']}")
-    print(f"Files copied: {stats['copied']}")
+    try:
+        stats = convert(args.input, args.output, args.num_threads, args.codec, args.bitrate, args.normalize_volume, args.overwrite, use_two_pass)
+    except KeyboardInterrupt:
+        print("\nCtrl+C received: stopping gracefully...")
+        stats["interrupted"] = True
+    finally:
+        elapsed = time.time() - start_time
+
+        print("\n--- Conversion Summary ---")
+        print(f"Time elapsed: {format_elapsed_time(elapsed)}")
+        print(f"Files converted: {stats['converted']}")
+        print(f"Files copied: {stats['copied']}")
+        if stats["interrupted"]:
+            print("Run interrupted by user (Ctrl+C).")
 
 if __name__ == "__main__":
     main()
